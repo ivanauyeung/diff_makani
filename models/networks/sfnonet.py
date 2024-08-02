@@ -23,7 +23,8 @@ from torch.cuda import amp
 from functools import partial
 
 # helpers
-from makani.models.common import DropPath, MLP, DecoderWrapper, EncoderWrapper, Split
+from makani.models.common import DropPath, MLP, DecoderWrapper, EncoderWrapper
+# Split
 
 # import global convolution and non-linear spectral layers
 from makani.models.common import SpectralConv, FactorizedSpectralConv, SpectralAttention
@@ -778,6 +779,7 @@ class Encoder_sfno(nn.Module):
             # nn.init.kaiming_normal_(encoder_modules[-1].weight, mode="fan_in", nonlinearity="relu")
             encoder_modules.append(act())
             current_dim = hidden_dim
+            
         encoder_modules.append(nn.Conv2d(current_dim, output_dim, 1, bias=False))
         nn.init.kaiming_normal_(encoder_modules[-1].weight, mode="fan_in", nonlinearity="linear")
         self.fwd = nn.Sequential(*encoder_modules)
@@ -793,14 +795,43 @@ class Encoder_sfno(nn.Module):
             x = x.view(N, 2, -1)
             x = self.cube_embedding(x) 
             x = x.view(N, D*4, H, W)  # magic number: 4
-            return self.fwd(x)
+            cube = x
+            return self.fwd(x), cube
         else:
             N, D, H, W = x.shape
             return self.fwd(x)
 
+
+class Split(nn.Module):
+    def __init__(self, layers0, layers1, split_size, dim):
+        super(Split, self).__init__()
+        self.split_size = split_size
+        self.dim = dim
+        self.layers0 = nn.ModuleList(layers0)
+        self.layers1 = nn.ModuleList(layers1)
+
+    def forward(self, x):
+        y = []
+        res0 = []
+        res1 = []
+        # y = torch.cat([layer(input) for (layer, input) in zip(self.layers, torch.split(x, self.split_size, dim=self.dim))], dim = 1)
+        for (layer0, layer1, input) in zip(self.layers0, self.layers1, torch.split(x, self.split_size, dim=self.dim)):
+            x0, cube_result = checkpoint(layer0, input, use_reentrant=False)
+            res0.append(cube_result)
+            print('cube_result', cube_result.shape)
+            res1.append(x0)
+            x1 = checkpoint(layer1, x0, use_reentrant=False)
+            y.append(x1)
+        res0 = torch.cat(res0, dim=1)
+        res1 = torch.cat(res1, dim=1)
+        print('res0', res0.shape)
+        print('res1', res1.shape)
+        return y, res0, res1
+
 class EncoderWrapper_sfno(nn.Module):
     def __init__(self, inp_chans, num_layers, hidden_dim, act_layer,
                     trans_down,
+                    itrans_up,
                     trans,
                     itrans,
                     filter_type,
@@ -826,11 +857,13 @@ class EncoderWrapper_sfno(nn.Module):
         split_size = [8,13,13,13,13,13]
         input_dims = [i * 4 for i in split_size]  # magic number: 4
         # output_dims = [60,60,60,60,60,60]
-        output_dims = [100,100,100,100,100,100]
-        encoders = [Encoder_sfno(num_layers, i, o, hidden_dim, act_layer,
-                                trans_down = trans_down,
+        output_dims = [96,96,96,96,96,96]
+        # output_dims = [100,100,100,100,100,100]
+        # first downsample
+        encoders_0 = [Encoder_sfno(num_layers, i, o, hidden_dim, act_layer,
+                                trans_down = trans_down[0], # (origin_h, origin_w)
                                 trans = trans,
-                                itrans = itrans,
+                                itrans = itrans_up[0], # (mid_h, mid_w)
                                 filter_type=filter_type,
                                 operator_type=operator_type,
                                 mlp_ratio=mlp_ratio,
@@ -849,44 +882,68 @@ class EncoderWrapper_sfno(nn.Module):
                                 complex_activation=complex_activation,
                                 spectral_layers=spectral_layers,
                                 bias=bias,
-                                checkpointing=checkpointing) for i, o in zip(input_dims, output_dims)]
-        self.split = Split(encoders, split_size, dim=2)
+                                checkpointing=checkpointing, if_cube=1) for i, o in zip(input_dims, output_dims)]
+        encoders_1 = [Encoder_sfno(num_layers, i, o, hidden_dim, act_layer,
+                                trans_down = trans_down[1], #(h, w)
+                                trans = trans,
+                                itrans = itrans, #(h, w)
+                                filter_type=filter_type,
+                                operator_type=operator_type,
+                                mlp_ratio=mlp_ratio,
+                                mlp_drop_rate=mlp_drop_rate,
+                                path_drop_rate=path_drop_rate,
+                                # act_layer=act_layer,
+                                norm_layer=norm_layer,
+                                inner_skip=inner_skip,
+                                outer_skip=outer_skip,
+                                use_mlp=use_mlp,
+                                comm_feature_inp_name=comm_feature_inp_name,
+                                comm_feature_hidden_name=comm_feature_hidden_name,
+                                rank=rank,
+                                factorization=factorization,
+                                separable=separable,
+                                complex_activation=complex_activation,
+                                spectral_layers=spectral_layers,
+                                bias=bias,
+                                checkpointing=checkpointing, if_cube=0) for i, o in zip(output_dims, output_dims)]
+        self.split = Split(encoders_0, encoders_1, split_size, dim=2)
         # self.additional_encoder = MLP(in_features=inp_chans-73*2, hidden_features=hidden_dim, out_features=hidden_dim-sum(output_dims))
-        self.additional_encoder = Encoder_sfno(num_layers, inp_chans-73*2, hidden_dim-sum(output_dims), hidden_dim, act_layer,
-                                                trans_down = trans_down,
-                                                trans = trans,
-                                                itrans = itrans,
-                                                filter_type=filter_type,
-                                                operator_type=operator_type,
-                                                mlp_ratio=mlp_ratio,
-                                                mlp_drop_rate=mlp_drop_rate,
-                                                path_drop_rate=path_drop_rate,
-                                                # act_layer=act_layer,
-                                                norm_layer=norm_layer,
-                                                inner_skip=inner_skip,
-                                                outer_skip=outer_skip,
-                                                use_mlp=use_mlp,
-                                                comm_feature_inp_name=comm_feature_inp_name,
-                                                comm_feature_hidden_name=comm_feature_hidden_name,
-                                                rank=rank,
-                                                factorization=factorization,
-                                                separable=separable,
-                                                complex_activation=complex_activation,
-                                                spectral_layers=spectral_layers,
-                                                bias=bias,
-                                                checkpointing=checkpointing,
-                                                if_cube=0) 
+        # self.additional_encoder = Encoder_sfno(num_layers, inp_chans-73*2, hidden_dim-sum(output_dims), hidden_dim, act_layer,
+        #                                         trans_down = trans_down,
+        #                                         trans = trans,
+        #                                         itrans = itrans,
+        #                                         filter_type=filter_type,
+        #                                         operator_type=operator_type,
+        #                                         mlp_ratio=mlp_ratio,
+        #                                         mlp_drop_rate=mlp_drop_rate,
+        #                                         path_drop_rate=path_drop_rate,
+        #                                         # act_layer=act_layer,
+        #                                         norm_layer=norm_layer,
+        #                                         inner_skip=inner_skip,
+        #                                         outer_skip=outer_skip,
+        #                                         use_mlp=use_mlp,
+        #                                         comm_feature_inp_name=comm_feature_inp_name,
+        #                                         comm_feature_hidden_name=comm_feature_hidden_name,
+        #                                         rank=rank,
+        #                                         factorization=factorization,
+        #                                         separable=separable,
+        #                                         complex_activation=complex_activation,
+        #                                         spectral_layers=spectral_layers,
+        #                                         bias=bias,
+        #                                         checkpointing=checkpointing,
+        #                                         if_cube=0) 
 
     def forward(self, x):
         # reshape input
         x, additional_features = x[:, :73 *2, :, :], x[:, 73 *2:, :, :]
         x = x.view(x.shape[0], 2, 73, x.shape[2], x.shape[3])
         # y = self.split(x)
-        y = checkpoint(self.split, x, use_reentrant=False)
-        a = self.additional_encoder(additional_features)
+        y, res0, res1 = checkpoint(self.split, x, use_reentrant=False)
+        # a = self.additional_encoder(additional_features)
         # print('y', y.shape)
         # print('a', a.shape)
-        return torch.cat([y, a], dim=1)
+        # return torch.cat([y, a], dim=1)
+        return torch.cat(y, dim=1), res0, res1
 
 
 class SphericalFourierNeuralOperatorNetSfnoEnc(nn.Module):
@@ -947,9 +1004,13 @@ class SphericalFourierNeuralOperatorNetSfnoEnc(nn.Module):
         self.checkpointing = checkpointing
 
         # compute the downscaled image size
-        self.h = int(self.inp_shape[0] // scale_factor)
-        self.w = int(self.inp_shape[1] // scale_factor)
+        self.h = int(self.inp_shape[0] // scale_factor // scale_factor)
+        self.w = int(self.inp_shape[1] // scale_factor // scale_factor)
 
+        # h & w after first downsample
+        self.h_mid = int(self.inp_shape[0] // scale_factor)
+        self.w_mid = int(self.inp_shape[1] // scale_factor)
+        self.res_mid_conv = nn.Conv2d(self.embed_dim + self.embed_dim, self.embed_dim, 1, bias=False)
         # initialize spectral transforms
         self._init_spectral_transforms(spectral_transform, model_grid_type, sht_grid_type, hard_thresholding_fraction, max_modes)
 
@@ -978,14 +1039,6 @@ class SphericalFourierNeuralOperatorNetSfnoEnc(nn.Module):
             fblock_mlp_inp_name = self.encoder.comm_out_name
             fblock_mlp_hidden_name = "fout" if (self.encoder.comm_out_name == "fin") else "fin"
         else:
-            #=self.encoder = EncoderDecoder(
-            #    num_layers=encoder_layers,
-            #    input_dim=self.inp_chans,
-            #    output_dim=self.embed_dim,
-            #    hidden_dim=int(encoder_ratio * self.embed_dim),
-            #    act_layer=activation_function,
-            #    input_format="nchw",
-            #)
             inner_skip = "none"
             outer_skip = "linear"
             
@@ -996,6 +1049,7 @@ class SphericalFourierNeuralOperatorNetSfnoEnc(nn.Module):
             norm_layer = (norm_layer_all, norm_layer_all)
             self.encoder = EncoderWrapper_sfno(inp_chans, encoder_layers, self.embed_dim, activation_function,
                                                 trans_down = self.trans_down,
+                                                itrans_up = self.itrans_up,
                                                 trans = self.trans,
                                                 itrans = self.itrans,
                                                 filter_type=filter_type,
@@ -1039,13 +1093,20 @@ class SphericalFourierNeuralOperatorNetSfnoEnc(nn.Module):
 
         # FNO blocks
         self.blocks = nn.ModuleList([])
-        for ii in range(num_layers - 1): # jiaqilong modify num_layer -> num_layer - 1
-            i = ii + 1
+        for ii in range(num_layers - 2): # jiaqilong modify num_layer -> num_layer - 1
+            i = ii + 2
             first_layer = i == 0
             last_layer = i == num_layers - 1
-
-            forward_transform = self.trans_down if first_layer else self.trans
-            inverse_transform = self.itrans_up if last_layer else self.itrans
+            forward_transform = self.trans
+            if i == num_layers - 1:
+                inverse_transform = self.itrans_up[1]
+                forward_transform = self.trans_down[1]
+            elif i == num_layers - 2:
+                inverse_transform = self.itrans_up[0]
+            else:
+                inverse_transform = self.itrans
+            # forward_transform = self.trans_down if first_layer else self.trans
+            # inverse_transform = self.itrans_up if last_layer else self.itrans
 
             inner_skip = "none"
             outer_skip = "linear"
@@ -1105,7 +1166,7 @@ class SphericalFourierNeuralOperatorNetSfnoEnc(nn.Module):
         else:
             self.decoder = DecoderWrapper(
                 num_layers=encoder_layers,
-                input_dim=embed_dim,
+                input_dim=embed_dim + 73 * 4,
                # output_dim=self.out_chans,
                 hidden_dim=int(decoder_ratio * embed_dim),
                 act_layer=activation_function,
@@ -1188,8 +1249,10 @@ class SphericalFourierNeuralOperatorNetSfnoEnc(nn.Module):
                 isht_handle = thd.DistributedInverseRealSHT
 
             # set up
-            self.trans_down = sht_handle(*self.inp_shape, lmax=modes_lat, mmax=modes_lon, grid=model_grid_type).float()
-            self.itrans_up = isht_handle(*self.out_shape, lmax=modes_lat, mmax=modes_lon, grid=model_grid_type).float()
+            # only modify unparallelism
+
+            self.trans_down = [sht_handle(*self.inp_shape, lmax=modes_lat, mmax=modes_lon, grid=model_grid_type).float(), sht_handle(self.h_mid, self.w_mid, lmax=modes_lat, mmax=modes_lon, grid=model_grid_type).float()] 
+            self.itrans_up = [isht_handle(self.h_mid, self.w_mid, lmax=modes_lat, mmax=modes_lon, grid=model_grid_type).float(), isht_handle(*self.out_shape, lmax=modes_lat, mmax=modes_lon, grid=model_grid_type).float()]
             self.trans = sht_handle(self.h, self.w, lmax=modes_lat, mmax=modes_lon, grid=sht_grid_type).float()
             self.itrans = isht_handle(self.h, self.w, lmax=modes_lat, mmax=modes_lon, grid=sht_grid_type).float()
 
@@ -1220,8 +1283,8 @@ class SphericalFourierNeuralOperatorNetSfnoEnc(nn.Module):
             self.h_loc = self.itrans.lat_shapes[comm.get_rank("h")]
             self.w_loc = self.itrans.lon_shapes[comm.get_rank("w")]
         else:
-            self.inp_shape_loc = (self.trans_down.nlat, self.trans_down.nlon)
-            self.out_shape_loc = (self.itrans_up.nlat, self.itrans_up.nlon)
+            self.inp_shape_loc = (self.trans_down[0].nlat, self.trans_down[0].nlon)
+            self.out_shape_loc = (self.itrans_up[1].nlat, self.itrans_up[1].nlon)
             self.h_loc = self.itrans.nlat
             self.w_loc = self.itrans.nlon
 
@@ -1229,11 +1292,16 @@ class SphericalFourierNeuralOperatorNetSfnoEnc(nn.Module):
     def no_weight_decay(self):
         return {"pos_embed", "cls_token"}
 
-    def _forward_features(self, x):
+    def _forward_features(self, x, res_mid):
         for r in range(self.repeat_layers):
             for blk in self.blocks:
                 if self.checkpointing >= 3:
+                    # print(x.shape)
+                    print(x.shape, res_mid.shape)
                     x = checkpoint(blk, x, use_reentrant=False)
+                    if x.shape[-1] == res_mid.shape[-1]:
+                        x = torch.cat([x, res_mid], dim=1)
+                        x = self.res_mid_conv(x)
                 else:
                     x = blk(x)
 
@@ -1260,10 +1328,10 @@ class SphericalFourierNeuralOperatorNetSfnoEnc(nn.Module):
             x = scatter_to_parallel_region(x, 1, "fin")
 
         if self.checkpointing >= 1:
-            x = checkpoint(self.encoder, x, use_reentrant=False)
+            x, res_cube, res_mid = checkpoint(self.encoder, x, use_reentrant=False)
         else:
-            x = self.encoder(x)
-
+            x, res_cube, res_mid  = self.encoder(x)
+            
         if hasattr(self, "pos_embed"):
             if self.pos_embed.type == "frequency":
                 pos_embed = torch.stack([self.pos_embed[0], nn.functional.pad(self.pos_embed[1], (1, 0), "constant", 0)], dim=-1)
@@ -1279,8 +1347,8 @@ class SphericalFourierNeuralOperatorNetSfnoEnc(nn.Module):
         x = self.pos_drop(x)
 
         # do the feature extraction
-        x = self._forward_features(x)
-
+        x = self._forward_features(x, res_mid)
+        x = torch.cat([x, res_cube], dim=1)
         if self.checkpointing >= 1:
             x = checkpoint(self.decoder, x, use_reentrant=False)
         else:
@@ -1289,6 +1357,8 @@ class SphericalFourierNeuralOperatorNetSfnoEnc(nn.Module):
         if hasattr(self.decoder, "comm_out_name") and (comm.get_size(self.decoder.comm_out_name) > 1):
             x = gather_from_parallel_region(x, 1, self.gather_shapes, self.decoder.comm_out_name)
 
+
+        # big skip: learning diff
         if self.big_skip:
             x = x + self.residual_transform(residual)
         
